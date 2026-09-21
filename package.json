@@ -1,0 +1,23 @@
+{
+  "name": "distributed-job-scheduler",
+  "version": "0.1.0",
+  "description": "A distributed job scheduler with exactly-once execution guarantees, built to demonstrate distributed locking, lease-based crash recovery, and queue-based execution.",
+  "type": "module",
+  "scripts": {
+    "start:api": "node src/api/server.js",
+    "start:scheduler": "node src/scheduler/poller.js",
+    "start:worker": "node src/worker/executor.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "pg": "^8.12.0",
+    "ioredis": "^5.4.1",
+    "bullmq": "^5.12.0",
+    "cron-parser": "^4.9.0",
+    "uuid": "^9.0.1",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}

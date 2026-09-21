@@ -1,0 +1,82 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: scheduler
+      POSTGRES_PASSWORD: scheduler
+      POSTGRES_DB: job_scheduler
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scheduler -d job_scheduler"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # The API is what registers/lists/updates jobs. One instance is enough.
+  api:
+    build: .
+    command: node src/api/server.js
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://scheduler:scheduler@postgres:5432/job_scheduler
+      REDIS_URL: redis://redis:6379
+      PORT: 3000
+    ports:
+      - "3000:3000"
+
+  # Scheduler polls for due jobs. Safe to run more than one of these —
+  # that's the entire point of the Redis lock. Start with 1 for now;
+  # we'll bump this to prove the locking works once it's built.
+  scheduler:
+    build: .
+    command: node src/scheduler/poller.js
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://scheduler:scheduler@postgres:5432/job_scheduler
+      REDIS_URL: redis://redis:6379
+
+  # Worker executes claimed jobs. This is the one we'll scale to 3
+  # instances later for the load test.
+  worker:
+    build: .
+    command: node src/worker/executor.js
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://scheduler:scheduler@postgres:5432/job_scheduler
+      REDIS_URL: redis://redis:6379
+
+volumes:
+  pgdata:
