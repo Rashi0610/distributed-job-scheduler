@@ -9,7 +9,7 @@ services:
       POSTGRES_PASSWORD: scheduler
       POSTGRES_DB: job_scheduler
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./db/schema.sql:/docker-entrypoint-initdb.d/schema.sql
