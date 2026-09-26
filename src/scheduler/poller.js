@@ -14,7 +14,7 @@ async function findDueJobs() {
   // these to reschedule the job after it finishes executing.
   const result = await query(
     `SELECT id, name, next_run_at, target_url, payload,
-            cron_expression, run_at, timezone
+            cron_expression, run_at, timezone, max_attempts
      FROM jobs
      WHERE status = 'active'
        AND next_run_at <= now()
@@ -56,6 +56,8 @@ async function pollOnce() {
       runAt: job.run_at,
       oldNextRunAt: job.next_run_at,
       timezone: job.timezone,
+      maxAttempts: job.max_attempts,
+      attempt: 1, // first try -- the worker increments this on each retry
     });
 
     console.log(`  enqueued ${job.id} for execution (lock stays held until worker finishes)`);
