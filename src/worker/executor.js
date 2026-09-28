@@ -15,13 +15,16 @@ async function reschedule(job) {
       tz: job.timezone || "UTC",
     });
     const nextRunAt = interval.next().toDate();
-    await query(`UPDATE jobs SET next_run_at = $1, updated_at = now() WHERE id = $2`, [
-      nextRunAt,
-      job.jobId,
-    ]);
+    await query(
+      `UPDATE jobs SET next_run_at = $1, current_occurrence_id = NULL, updated_at = now() WHERE id = $2`,
+      [nextRunAt, job.jobId]
+    );
     console.log(`  rescheduled ${job.jobId} -- next run at ${nextRunAt.toISOString()}`);
   } else {
-    await query(`UPDATE jobs SET status = 'archived', updated_at = now() WHERE id = $1`, [job.jobId]);
+    await query(
+      `UPDATE jobs SET status = 'archived', current_occurrence_id = NULL, updated_at = now() WHERE id = $1`,
+      [job.jobId]
+    );
     console.log(`  archived ${job.jobId} -- one-time job, already ran`);
   }
 }
@@ -77,9 +80,9 @@ async function executeJob(bullJob) {
 
   await query(
     `INSERT INTO executions
-       (job_id, scheduled_for, attempt, status, claimed_by, started_at, finished_at, response_status, error_message)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-    [job.jobId, job.oldNextRunAt, job.attempt, recordedStatus, job.ownerId, startedAt, finishedAt, responseStatus, errorMessage]
+       (job_id, occurrence_id, scheduled_for, attempt, status, claimed_by, started_at, finished_at, response_status, error_message)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+    [job.jobId, job.occurrenceId, job.oldNextRunAt, job.attempt, recordedStatus, job.ownerId, startedAt, finishedAt, responseStatus, errorMessage]
   );
 
   if (failed && !exhausted) {

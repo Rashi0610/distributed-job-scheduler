@@ -10,11 +10,10 @@ const LOCK_TTL_MS = 30000;
 const instanceId = randomUUID();
 
 async function findDueJobs() {
-  // Added cron_expression, run_at, and timezone -- the worker needs
-  // these to reschedule the job after it finishes executing.
   const result = await query(
     `SELECT id, name, next_run_at, target_url, payload,
-            cron_expression, run_at, timezone, max_attempts
+            cron_expression, run_at, timezone, max_attempts,
+            current_occurrence_id
      FROM jobs
      WHERE status = 'active'
        AND next_run_at <= now()
@@ -22,6 +21,30 @@ async function findDueJobs() {
      LIMIT 20`
   );
   return result.rows;
+}
+
+// Decides: is this a brand-new occurrence, or one recovering after an
+// interrupted retry chain (e.g. Redis was wiped mid-retry)? If an
+// occurrence id already exists on the job, we recount real attempts
+// from the durable executions table instead of trusting a fresh "1".
+async function resolveOccurrence(job) {
+  if (!job.current_occurrence_id) {
+    const occurrenceId = randomUUID();
+    await query(`UPDATE jobs SET current_occurrence_id = $1 WHERE id = $2`, [occurrenceId, job.id]);
+    return { occurrenceId, attempt: 1 };
+  }
+
+  // An occurrence id already exists -- this job was already mid-retry
+  // at some point. Count real attempts from Postgres rather than
+  // trusting anything that might have lived only in Redis.
+  const occurrenceId = job.current_occurrence_id;
+  const result = await query(
+    `SELECT COUNT(*) FROM executions WHERE job_id = $1 AND occurrence_id = $2`,
+    [job.id, occurrenceId]
+  );
+  const priorAttempts = parseInt(result.rows[0].count, 10);
+  console.log(`  RECOVERED occurrence ${occurrenceId.slice(0, 8)} for ${job.id} -- ${priorAttempts} prior attempt(s) found in Postgres`);
+  return { occurrenceId, attempt: priorAttempts + 1 };
 }
 
 async function pollOnce() {
@@ -44,23 +67,24 @@ async function pollOnce() {
 
     console.log(`  CLAIMED  ${job.id} "${job.name}" by instance ${instanceId.slice(0, 8)}`);
 
+    const { occurrenceId, attempt } = await resolveOccurrence(job);
+
     await executionQueue.add("execute-job", {
       jobId: job.id,
       name: job.name,
       targetUrl: job.target_url,
       payload: job.payload,
       ownerId: instanceId,
-      // Needed for rescheduling after execution -- trusting these
-      // values as of claim time, per our decision.
       cronExpression: job.cron_expression,
       runAt: job.run_at,
       oldNextRunAt: job.next_run_at,
       timezone: job.timezone,
       maxAttempts: job.max_attempts,
-      attempt: 1, // first try -- the worker increments this on each retry
+      occurrenceId,
+      attempt,
     });
 
-    console.log(`  enqueued ${job.id} for execution (lock stays held until worker finishes)`);
+    console.log(`  enqueued ${job.id} for execution (occurrence ${occurrenceId.slice(0, 8)}, attempt ${attempt})`);
   }
 }
 
