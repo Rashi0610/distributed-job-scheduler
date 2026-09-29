@@ -1,11 +1,15 @@
 import { randomUUID } from "crypto";
 import { query } from "../lib/db.js";
 import { redis } from "../lib/redis.js";
-import { claimLock } from "../lib/lock.js";
+import { claimLock, releaseLock } from "../lib/lock.js";
+import { nextRunAfter } from "../lib/schedule.js";
 import { executionQueue } from "../lib/queue.js";
 
 const POLL_INTERVAL_MS = 5000;
 const LOCK_TTL_MS = 30000;
+// Overdue by more than this = a misfire (poll interval is 5s, so
+// anything smaller is just normal lateness).
+const MISFIRE_GRACE_MS = 30000;
 
 const instanceId = randomUUID();
 
@@ -13,7 +17,7 @@ async function findDueJobs() {
   const result = await query(
     `SELECT id, name, next_run_at, target_url, payload,
             cron_expression, run_at, timezone, max_attempts,
-            current_occurrence_id
+            current_occurrence_id, misfire_policy
      FROM jobs
      WHERE status = 'active'
        AND next_run_at <= now()
@@ -67,6 +71,24 @@ async function pollOnce() {
 
     console.log(`  CLAIMED  ${job.id} "${job.name}" by instance ${instanceId.slice(0, 8)}`);
 
+    // Misfire check: only for a FRESH occurrence of a recurring job.
+    // A job with an occurrence id is mid-retry and must continue its
+    // chain, and one-time jobs have no "next occurrence" to skip to.
+    const overdueMs = Date.now() - new Date(job.next_run_at).getTime();
+    const isMisfire = !job.current_occurrence_id && job.cron_expression && overdueMs > MISFIRE_GRACE_MS;
+
+    if (isMisfire && job.misfire_policy === "skip") {
+      const next = nextRunAfter(job.cron_expression, job.timezone, new Date());
+      await query(`UPDATE jobs SET next_run_at = $1, updated_at = now() WHERE id = $2`, [next, job.id]);
+      await releaseLock(redis, job.id, instanceId);
+      console.log(`  MISFIRE-SKIP ${job.id} -- ${Math.round(overdueMs / 1000)}s overdue, skipped ahead to ${next.toISOString()}`);
+      continue;
+    }
+
+    if (isMisfire) {
+      console.log(`  MISFIRE ${job.id} -- ${Math.round(overdueMs / 1000)}s overdue, policy ${job.misfire_policy}`);
+    }
+
     const { occurrenceId, attempt } = await resolveOccurrence(job);
 
     await executionQueue.add("execute-job", {
@@ -82,6 +104,8 @@ async function pollOnce() {
       maxAttempts: job.max_attempts,
       occurrenceId,
       attempt,
+      // fire_once: after this catch-up run, jump ahead instead of replaying the rest
+      rescheduleFromNow: Boolean(isMisfire && job.misfire_policy === "fire_once"),
     });
 
     console.log(`  enqueued ${job.id} for execution (occurrence ${occurrenceId.slice(0, 8)}, attempt ${attempt})`);

@@ -19,6 +19,20 @@ CREATE TABLE IF NOT EXISTS jobs (
     max_attempts    INT NOT NULL DEFAULT 3,
     timeout_ms      INT NOT NULL DEFAULT 10000,
 
+    -- What to do when a recurring job is found overdue after downtime:
+    --   fire_all  - replay every missed occurrence
+    --   fire_once - run one catch-up execution, then skip ahead
+    --   skip      - run nothing for missed occurrences, skip ahead
+    misfire_policy  TEXT NOT NULL DEFAULT 'fire_once'
+                        CHECK (misfire_policy IN ('fire_all', 'fire_once', 'skip')),
+
+    -- Set once when an occurrence is first claimed, cleared when it
+    -- finishes (success or dead-letter). NULL means "no occurrence in
+    -- progress." This is what lets a from-scratch scheduler restart
+    -- (after a Redis wipe) recognize "this due job was already
+    -- mid-retry" instead of assuming it's starting fresh at attempt 1.
+    current_occurrence_id UUID,
+
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
 
@@ -39,6 +53,12 @@ CREATE INDEX IF NOT EXISTS idx_jobs_due
 CREATE TABLE IF NOT EXISTS executions (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     job_id          UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+
+    -- Ties every attempt to the specific occurrence it belongs to --
+    -- stable across retries, unlike scheduled_for which shifts as
+    -- next_run_at moves to each retry's timing. This is the durable
+    -- identity that survives a Redis wipe.
+    occurrence_id   UUID NOT NULL,
 
     scheduled_for   TIMESTAMPTZ NOT NULL,
     attempt         INT NOT NULL DEFAULT 1,
@@ -61,6 +81,13 @@ CREATE TABLE IF NOT EXISTS executions (
 
 CREATE INDEX IF NOT EXISTS idx_executions_job_id ON executions (job_id);
 CREATE INDEX IF NOT EXISTS idx_executions_status ON executions (status);
+
+-- Guards against a redelivered queue message (e.g. BullMQ's own
+-- stalled-job recovery after a killed worker) executing the same
+-- attempt twice. NULLs (pre-Session-8 rows, before occurrence_id
+-- existed) are exempt from uniqueness in Postgres, so this is safe to
+-- add without touching old data.
+ALTER TABLE executions ADD CONSTRAINT uniq_occurrence_attempt UNIQUE (occurrence_id, attempt);
 
 -- Needed for gen_random_uuid() above.
 CREATE EXTENSION IF NOT EXISTS pgcrypto;

@@ -1,20 +1,19 @@
 import { Worker } from "bullmq";
-import parser from "cron-parser";
 import { createConnection, redis } from "../lib/redis.js";
 import { releaseLock, extendLock } from "../lib/lock.js";
 import { query } from "../lib/db.js";
 import { executionQueue } from "../lib/queue.js";
+import { nextRunAfter } from "../lib/schedule.js";
 
-// Anchors recurring jobs to the OLD next_run_at (not "now") so small
-// delays don't accumulate into long-term drift. Also handles one-time
-// jobs (archive -- they already had their one occurrence).
+// Decides the job's schedule after an occurrence finishes: next cron
+// time for recurring jobs, archive for one-time jobs.
 async function reschedule(job) {
   if (job.cronExpression) {
-    const interval = parser.parseExpression(job.cronExpression, {
-      currentDate: new Date(job.oldNextRunAt),
-      tz: job.timezone || "UTC",
-    });
-    const nextRunAt = interval.next().toDate();
+    // Normally anchor to the old scheduled time, so a late run does not
+    // skip occurrences. After a fire_once misfire, anchor to now instead
+    // to jump past everything that was missed.
+    const from = job.rescheduleFromNow ? new Date() : new Date(job.oldNextRunAt);
+    const nextRunAt = nextRunAfter(job.cronExpression, job.timezone, from);
     await query(
       `UPDATE jobs SET next_run_at = $1, current_occurrence_id = NULL, updated_at = now() WHERE id = $2`,
       [nextRunAt, job.jobId]
@@ -37,6 +36,26 @@ function backoffMs(attempt) {
 async function executeJob(bullJob) {
   const job = bullJob.data;
   const startedAt = new Date();
+
+  // Claim this exact (occurrence, attempt) pair before doing anything
+  // else. If a redelivered message (e.g. BullMQ's own stall recovery
+  // after a killed worker) arrives for an attempt we already claimed,
+  // the unique constraint makes Postgres reject the second INSERT --
+  // atomically, so there is no race window. The loser exits here,
+  // before ever calling the target URL.
+  const claim = await query(
+    `INSERT INTO executions (job_id, occurrence_id, scheduled_for, attempt, status, claimed_by, started_at)
+     VALUES ($1, $2, $3, $4, 'running', $5, $6)
+     ON CONFLICT (occurrence_id, attempt) DO NOTHING
+     RETURNING id`,
+    [job.jobId, job.occurrenceId, job.oldNextRunAt, job.attempt, job.ownerId, startedAt]
+  );
+
+  if (claim.rowCount === 0) {
+    console.log(`  DUPLICATE DELIVERY ${job.jobId} occurrence ${job.occurrenceId} attempt ${job.attempt} -- already claimed, skipping (no HTTP call made)`);
+    return;
+  }
+  const executionId = claim.rows[0].id;
 
   console.log(`  EXECUTING ${job.jobId} "${job.name}" (attempt ${job.attempt}/${job.maxAttempts}) -> ${job.targetUrl}`);
 
@@ -78,11 +97,13 @@ async function executeJob(bullJob) {
   // that gave up."
   const recordedStatus = exhausted ? "dead_letter" : rawStatus;
 
+  // Update the row we claimed above with the real outcome, rather
+  // than inserting a second row.
   await query(
-    `INSERT INTO executions
-       (job_id, occurrence_id, scheduled_for, attempt, status, claimed_by, started_at, finished_at, response_status, error_message)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-    [job.jobId, job.occurrenceId, job.oldNextRunAt, job.attempt, recordedStatus, job.ownerId, startedAt, finishedAt, responseStatus, errorMessage]
+    `UPDATE executions
+     SET status = $1, finished_at = $2, response_status = $3, error_message = $4
+     WHERE id = $5`,
+    [recordedStatus, finishedAt, responseStatus, errorMessage, executionId]
   );
 
   if (failed && !exhausted) {
